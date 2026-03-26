@@ -55,3 +55,92 @@ def build_features(session: Session, recent_days: int = 30):
         data.append(fv)
     df = pd.DataFrame(data)
     return df
+
+# Poisson: λ_home = (home_avg_goals + away_avg_goals_against)/2
+def poisson_predictions(home_lambda, away_lambda, max_goals=5):
+    probs = []
+    for h in range(max_goals+1):
+        for a in range(max_goals+1):
+            p = poisson_pmf(h, home_lambda) * poisson_pmf(a, away_lambda)
+            probs.append(((h, a), p))
+    return probs
+
+def poisson_pmf(k, lam):
+    return np.exp(-lam) * (lam**k) / np.math.factorial(k)
+
+def train_classifiers(df: pd.DataFrame):
+    X = df.drop(columns="target")
+    y = df["target"]
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Logistic Regression
+    lr = LogisticRegression(max_iter=1000)
+    lr.fit(X_train, y_train)
+    lr_pred = lr.predict_proba(X_val)
+
+    # Random Forest
+    rf = RandomForestClassifier(n_estimators=200, max_depth=12)
+    rf.fit(X_train, y_train)
+    rf_pred = rf.predict_proba(X_val)
+
+    # XGBoost
+    xgb = XGBClassifier(n_estimators=300, learning_rate=0.05)
+    xgb.fit(X_train, y_train)
+    xgb_pred = xgb.predict_proba(X_val)
+
+    # Calibration (Isotonic)
+    lr_cal = CalibratedClassifierCV(lr, cv='prefit', method='isotonic')
+    lr_cal.fit(X_train, y_train)
+    lr_pred_cal = lr_cal.predict_proba(X_val)
+
+    # Save best model by log-loss
+    models = {
+        "lr": lr_cal,
+        "rf": rf,
+        "xgb": xgb
+    }
+    return models
+
+def compute_market_probabilities(match, model):
+    # Example: 1X2 from classification probabilities
+    probs = model.predict_proba(match.to_features_vector())[0]
+    prob_home, prob_draw, prob_away = probs
+    return {
+        "1": prob_home,
+        "X": prob_draw,
+        "2": prob_away
+    }
+
+def compute_over_under_probs(match, model, line=2.5):
+    # Poisson: sum probabilities of total goals > line
+    probs = model.predict_proba(match.to_features_vector())[0]
+    # For simplicity, use logistic model to predict total goals
+    total_goals_pred = probs.sum()
+    over_prob = 1 - scipy.stats.poisson.cdf(line, total_goals_pred)
+    return over_prob
+
+def compute_exact_goals(match, model, scoreline=(1,0)):
+    # Use Poisson to get probability of that exact score
+    # λ values from features
+    home_lambda = match.home_avg_goals
+    away_lambda = match.away_avg_goals
+    return poisson_pmf(scoreline[0], home_lambda) * poisson_pmf(scoreline[1], away_lambda)
+
+def store_predictions(session: Session, match_id, market_name, probs: dict):
+    pred = session.query(Prediction).filter_by(
+        fixture_id=match_id,
+        market_name=market_name
+    ).first()
+    if not pred:
+        pred = Prediction(fixture_id=match_id,
+                          market_name=market_name,
+                          probabilities=str(probs),
+                          created_at=datetime.utcnow())
+        session.add(pred)
+    else:
+        pred.probabilities = str(probs)
+        pred.created_at = datetime.utcnow()
+    session.commit()
